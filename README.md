@@ -74,6 +74,69 @@ Authorization: Bearer <token>
 * **Local File Read**: `file://` protocol allows reading server-side files (e.g. `/etc/passwd`, application config files containing DB credentials).
 * **Chained RCE** (environment-dependent): In cloud environments with IMDSv1, SSRF leads to IAM credential theft and full cloud account compromise.
 
+# CVSS Discrepancy: MITRE Published Record vs. Source Code Evidence
+
+On 2026-08-28, MITRE published **CVE-2026-82081** with the following record:
+
+* **CVSS 3.1 base score:** 6.4 (Medium)
+* **CWE:** CWE-918 (Server-Side Request Forgery) — **only**
+* **Confidentiality metric:** `C:L` (Low)
+
+The original CNA-LR submission carried a base score of **8.5** with vector `CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:C/C:H/I:L/A:N` and referenced two distinct weaknesses (CWE-918 and CWE-79). The published record diverges from the submission on two points:
+
+1. **Confidentiality was lowered** from `H` to `L`.
+2. **CWE-79 (Improper Neutralization of Input During Web Page Generation — Stored XSS) was removed** from the record.
+
+An independent audit against the upstream source (`wallabag/wallabag`, branch `master`, commit consistent with release 2.6.14) documents that neither change is supported by the code.
+
+## Evidence for the omitted CWE-79 (Stored XSS)
+
+* `src/Controller/Api/EntryRestController.php:987` — `$entry->setTitle($data['title'])` is called with no sanitization, encoding, or validation between the request body and the database write.
+* `src/Helper/ContentProxy.php:273` — `$entry->setContent($content['html'])` persists the payload byte-for-byte; the only `sanitize*` symbols in `src/` are `sanitizeContentTitle()` / `sanitizeUTF8Text()` (UTF-8 encoding normalization, not HTML filtering) and `svgSanitize\Sanitizer` in `DownloadImages.php` (SVG-only, applied to downloaded images).
+* **`HTMLPurifier` is not present in the codebase.** A recursive grep for `HTMLPurifier|htmlpurifier` across the repository and `composer.json` returns zero matches.
+* The stored content is rendered with the Twig `|raw` filter — which explicitly disables auto-escaping — in three templates:
+  * `templates/Entry/entry.html.twig:370`
+  * `templates/Entry/share.html.twig:31`
+  * `templates/Entry/entries.xml.twig:49`
+
+An `<script>` payload injected via `POST /api/entries` therefore reaches the DOM of any authenticated user viewing the article in the application's own origin, enabling session hijacking and account takeover. The vulnerability class corresponds directly to CWE-79 and its omission from the published record is inconsistent with the source.
+
+## Evidence for the Confidentiality downgrade (`H` → `L`)
+
+* `src/Helper/EntriesExport.php:286-300` concatenates the unsanitized values of `$entry->getTitle()` and `$entry->getContent()` and passes them to `TCPDF::writeHTMLCell()`.
+* The TCPDF dependency is declared at `composer.json:160` (`"tecnickcom/tcpdf": "^6.8.2"`). TCPDF resolves `<img src>` attributes through the native PHP stream wrappers with **no protocol allowlist, no host restriction, and no filter on link-local or RFC1918 targets**.
+* No mitigation is present in the surrounding code path: no `CURLOPT_PROTOCOLS` restriction, no pre-render filter on `<img>`, no SSRF guard middleware, no `stream_context_create` with protocol filtering.
+
+Consequences directly reachable from an attacker-controlled article body:
+
+| Payload | Server-side effect |
+|---|---|
+| `<img src="file:///etc/passwd">` | Local file read via the `file://` wrapper |
+| `<img src="file:///var/www/wallabag/app/config/parameters.yml">` | Disclosure of database credentials and Symfony secrets |
+| `<img src="http://169.254.169.254/latest/meta-data/iam/security-credentials/">` | Cloud instance metadata read (IMDSv1) — IAM credential exposure |
+| `<img src="http://127.0.0.1:9200/_search">` | Discovery and read from unexposed internal services |
+
+The demonstrable read of arbitrary local files and cloud instance credentials is inconsistent with a `C:L` rating.
+
+## Corrected CVSS vector based on source evidence
+
+Considering both weaknesses that the record should represent — CWE-918 and CWE-79 — the vector aligned with the code is:
+
+```
+CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:C/C:H/I:H/A:L   →   9.0 Critical
+```
+
+| Metric | Value | Rationale |
+|---|---|---|
+| AV | N | Reachable via the HTTP API |
+| AC | L | No special conditions beyond holding a valid account |
+| PR | L | Any authenticated user can `POST /api/entries` |
+| UI | N | Passive activation on entry view (XSS) or standard export flow (SSRF) |
+| S | C | SSRF crosses the application's security authority (cloud metadata, RFC1918, host filesystem); XSS in application origin can act on external tokens |
+| C | H | Local file contents + cloud IAM credentials + session cookies |
+| I | H | XSS enables arbitrary actions in the victim's session |
+| A | L | Partial DoS reachable through malformed injected payloads |
+
 # Affected component versions
 
 **Wallabag:** 2.7.0-dev (commit 4504e3c, branch master) / latest stable: 2.6.14
@@ -136,4 +199,16 @@ This timeline tracks the events from the opening of the advisory to the epilogue
 
 
 ### August 16, 2026
-* **CVE Submission:** CAN-2026-2035733 was reserved by MITRE CNA-LR and submitted for assignment on August 16, 2026. Public reference: [https://infosec.exchange/@FUNFACTOR1/117093620077858014](https://infosec.exchange/@FUNFACTOR1/117093620077858014)
+* **CVE Assignment:** CVE-2026-82081 (MITRE CNA-LR, published 2026-08-28). Public reference: [https://infosec.exchange/@FUNFACTOR1/117093620077858014](https://infosec.exchange/@FUNFACTOR1/117093620077858014)
+
+Note on CVSS scoring discrepancy: see section "CVSS Discrepancy: MITRE Published Record vs. Source Code Evidence" below.
+
+---
+
+# Independent Scoring and NVD Review
+
+The National Vulnerability Database (NVD) performs its own CVSS analysis on published CVE records, independent from the assigning CNA. NVD's Vulnerability Analysis Team routinely reviews scores where the published metrics diverge from the technical evidence available in the underlying source code.
+
+The discrepancy documented in the section above — the removal of CWE-79 and the downgrade of Confidentiality from `H` to `L` — has been formally reported to MITRE on 2026-08-28 with the file/line evidence, dependency versions, and reproducible payloads listed above.
+
+Analysts reviewing CVE-2026-82081 for independent enrichment are invited to consult the source-level evidence provided in this disclosure — file paths, line numbers, dependency declarations in `composer.json`, and the Twig rendering sinks — when producing their own assessment of the record.
